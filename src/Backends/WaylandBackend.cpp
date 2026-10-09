@@ -128,6 +128,27 @@ namespace gamescope
 {
     extern std::shared_ptr<INestedHints::CursorInfo> GetX11HostCursor();
 
+    static inline void WaylandScaleCursor( const INestedHints::CursorInfo &info, uint32_t uScale, uint32_t &uDstWidth, uint32_t &uDstHeight, uint32_t &uHotspotX, uint32_t &uHotspotY ) {
+        uDstWidth = std::max( 1u, WaylandScaleToLogical( info.uWidth, uScale ) );
+        uDstHeight = std::max( 1u, WaylandScaleToLogical( info.uHeight, uScale ) );
+        uHotspotX = info.uWidth ? ( info.uXHotspot * uDstWidth ) / info.uWidth : 0;
+        uHotspotY = info.uHeight ? ( info.uYHotspot * uDstHeight ) / info.uHeight : 0;
+    }
+    static inline void WaylandApplyCursorScale( wp_viewport *pViewport, const INestedHints::CursorInfo *pInfo, uint32_t uScale, uint32_t &uHotspotX, uint32_t &uHotspotY ) {
+        if ( !pInfo )
+            return;
+
+        uHotspotX = pInfo->uXHotspot;
+        uHotspotY = pInfo->uYHotspot;
+
+        if ( pViewport && pInfo->uWidth > 0 && pInfo->uHeight > 0 )
+        {
+            uint32_t uDstWidth, uDstHeight;
+            WaylandScaleCursor( *pInfo, uScale, uDstWidth, uDstHeight, uHotspotX, uHotspotY );
+            wp_viewport_set_destination( pViewport, uDstWidth, uDstHeight );
+        }
+    }
+
     gamescope::ConVar<bool> cv_wayland_mouse_warp_without_keyboard_focus( "wayland_mouse_warp_without_keyboard_focus", true, "Should we only forward mouse warps to the app when we have keyboard focus?" );
     gamescope::ConVar<bool> cv_wayland_mouse_relmotion_without_keyboard_focus( "wayland_mouse_relmotion_without_keyboard_focus", false, "Should we only forward mouse relative motion to the app when we have keyboard focus?" );
     gamescope::ConVar<bool> cv_wayland_use_modifiers( "wayland_use_modifiers", true, "Use DMA-BUF modifiers?" );
@@ -701,7 +722,7 @@ namespace gamescope
     protected:
         virtual void OnBackendBlobDestroyed( BackendBlob *pBlob ) override;
 
-        wl_surface *CursorInfoToSurface( const std::shared_ptr<INestedHints::CursorInfo> &info, wl_surface *pCursorSurface = nullptr );
+        wl_surface *CursorInfoToSurface( const std::shared_ptr<INestedHints::CursorInfo> &info, wl_surface *pCursorSurface = nullptr, wp_viewport **ppViewport = nullptr, uint32_t *pHotspotX = nullptr, uint32_t *pHotspotY = nullptr );
 
         bool SupportsColorManagement() const;
 
@@ -709,6 +730,7 @@ namespace gamescope
         void SetRelativeMouseMode( wl_surface *pSurface, bool bRelative );
         void RecreateLockedPointer( wl_surface *pSurface );
         void UpdateCursor();
+        void UpdateCursorScale();
 
         friend CWaylandConnector;
         friend CWaylandPlane;
@@ -865,8 +887,15 @@ namespace gamescope
 
         std::shared_ptr<INestedHints::CursorInfo> m_pCursorInfo;
         wl_surface *m_pCursorSurface = nullptr;
+        wp_viewport *m_pCursorViewport = nullptr;
+        uint32_t m_uCursorHotspotX = 0;
+        uint32_t m_uCursorHotspotY = 0;
+
         std::shared_ptr<INestedHints::CursorInfo> m_pDefaultCursorInfo;
         wl_surface *m_pDefaultCursorSurface = nullptr;
+        wp_viewport *m_pDefaultCursorViewport = nullptr;
+        uint32_t m_uDefaultCursorHotspotX = 0;
+        uint32_t m_uDefaultCursorHotspotY = 0;
     };
     const wl_registry_listener CWaylandBackend::s_RegistryListener =
     {
@@ -1970,6 +1999,7 @@ namespace gamescope
             }
 
             s_uGlobalFractionalScale = uScale;
+            m_pBackend->UpdateCursorScale();
             bDirty = true;
         }
 
@@ -2159,7 +2189,7 @@ namespace gamescope
         }
 
         m_pDefaultCursorInfo = GetX11HostCursor();
-        m_pDefaultCursorSurface = CursorInfoToSurface( m_pDefaultCursorInfo );
+        m_pDefaultCursorSurface = CursorInfoToSurface( m_pDefaultCursorInfo, nullptr, &m_pDefaultCursorViewport, &m_uDefaultCursorHotspotX, &m_uDefaultCursorHotspotY );
 
         xdg_log.infof( "Post-Initted Wayland backend" );
 
@@ -2415,7 +2445,7 @@ namespace gamescope
         },
     };
 
-    wl_surface *CWaylandBackend::CursorInfoToSurface( const std::shared_ptr<INestedHints::CursorInfo> &info, wl_surface *pCursorSurface )
+    wl_surface *CWaylandBackend::CursorInfoToSurface( const std::shared_ptr<INestedHints::CursorInfo> &info, wl_surface *pCursorSurface, wp_viewport **ppViewport, uint32_t *pHotspotX, uint32_t *pHotspotY )
     {
         if ( !info )
             return pCursorSurface;
@@ -2425,6 +2455,11 @@ namespace gamescope
             pCursorSurface = wl_compositor_create_surface( m_pCompositor );
             if ( !pCursorSurface )
                 return nullptr;
+
+            if ( ppViewport && m_pViewporter )
+            {
+                *ppViewport = wp_viewporter_get_viewport( m_pViewporter, pCursorSurface );
+            }
         }
 
         uint32_t uStride = info->uWidth * 4;
@@ -2446,6 +2481,15 @@ namespace gamescope
 
         wl_buffer_add_listener( pBuffer, &s_CursorBufferListener, nullptr );
 
+        uint32_t uHotspotX = 0;
+        uint32_t uHotspotY = 0;
+        WaylandApplyCursorScale( ppViewport ? *ppViewport : nullptr, info.get(), s_uGlobalFractionalScale, uHotspotX, uHotspotY );
+
+        if ( pHotspotX )
+            *pHotspotX = uHotspotX;
+        if ( pHotspotY )
+            *pHotspotY = uHotspotY;
+
         wl_surface_attach( pCursorSurface, pBuffer, 0, 0 );
         wl_surface_damage( pCursorSurface, 0, 0, INT32_MAX, INT32_MAX );
         wl_surface_commit( pCursorSurface );
@@ -2461,7 +2505,7 @@ namespace gamescope
     void CWaylandBackend::SetCursorImage( std::shared_ptr<INestedHints::CursorInfo> info )
     {
         m_pCursorInfo = info;
-        m_pCursorSurface = CursorInfoToSurface( info, m_pCursorSurface );
+        m_pCursorSurface = CursorInfoToSurface( info, m_pCursorSurface, &m_pCursorViewport, &m_uCursorHotspotX, &m_uCursorHotspotY );
         UpdateCursor();
     }
     void CWaylandBackend::SetRelativeMouseMode( wl_surface *pSurface, bool bRelative )
@@ -2530,11 +2574,28 @@ namespace gamescope
             bUseHostCursor &= m_bPointerLocked;
 
         if ( bUseHostCursor && m_pDefaultCursorSurface )
-            wl_pointer_set_cursor( m_pPointer, m_uPointerEnterSerial, m_pDefaultCursorSurface, m_pDefaultCursorInfo->uXHotspot, m_pDefaultCursorInfo->uYHotspot );
-        else if ( bShowCursor && m_pCursorSurface && m_pCursorInfo )
-            wl_pointer_set_cursor( m_pPointer, m_uPointerEnterSerial, m_pCursorSurface, m_pCursorInfo->uXHotspot, m_pCursorInfo->uYHotspot );
+            wl_pointer_set_cursor( m_pPointer, m_uPointerEnterSerial, m_pDefaultCursorSurface, m_uDefaultCursorHotspotX, m_uDefaultCursorHotspotY );
+        else if ( bShowCursor && m_pCursorSurface )
+            wl_pointer_set_cursor( m_pPointer, m_uPointerEnterSerial, m_pCursorSurface, m_uCursorHotspotX, m_uCursorHotspotY );
         else
             wl_pointer_set_cursor( m_pPointer, m_uPointerEnterSerial, nullptr, 0, 0 );
+    }
+
+    void CWaylandBackend::UpdateCursorScale()
+    {
+        if ( m_pCursorSurface && m_pCursorViewport && m_pCursorInfo )
+        {
+            WaylandApplyCursorScale( m_pCursorViewport, m_pCursorInfo.get(), s_uGlobalFractionalScale, m_uCursorHotspotX, m_uCursorHotspotY );
+            wl_surface_commit( m_pCursorSurface );
+        }
+
+        if ( m_pDefaultCursorSurface && m_pDefaultCursorViewport && m_pDefaultCursorInfo )
+        {
+            WaylandApplyCursorScale( m_pDefaultCursorViewport, m_pDefaultCursorInfo.get(), s_uGlobalFractionalScale, m_uDefaultCursorHotspotX, m_uDefaultCursorHotspotY );
+            wl_surface_commit( m_pDefaultCursorSurface );
+        }
+
+        UpdateCursor();
     }
 
     /////////////////////
